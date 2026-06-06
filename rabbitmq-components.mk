@@ -64,6 +64,7 @@ dep_observer_cli = hex 1.8.2
 dep_seshat = hex 1.0.1
 dep_stdout_formatter = hex 0.2.4
 dep_sysmon_handler = hex 1.3.0
+dep_io_uring = git file:///home/areias/dev/opensource/io_uring.erl main
 
 # RabbitMQ applications found in the monorepo.
 #

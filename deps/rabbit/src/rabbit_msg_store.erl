@@ -709,6 +709,7 @@ reader_close(Reader) ->
 init([VHost, Type, BaseDir, ClientRefs, StartupFunState]) ->
     process_flag(trap_exit, true),
     pg:join({?MODULE, VHost, Type}, self()),
+    rabbit_io_uring:start(),
 
     Dir = filename:join(BaseDir, atom_to_list(Type)),
     Name = filename:join(filename:basename(BaseDir), atom_to_list(Type)),
@@ -1048,7 +1049,7 @@ internal_sync(State = #msstate { current_file_handle = CurHdl,
                                  clients             = Clients,
                                  cref_to_msg_ids     = CTM }) ->
     State1 = stop_sync_timer(State),
-    ok = writer_flush(CurHdl),
+    {ok, CurHdl1} = writer_flush(CurHdl),
     %% We confirm all pending messages because we know they are
     %% either on disk when we flush the current write file; or
     %% were removed by the queue already.
@@ -1058,7 +1059,7 @@ internal_sync(State = #msstate { current_file_handle = CurHdl,
             {_CPid, MsgOnDiskFun} -> MsgOnDiskFun(MsgIds, written)
         end
     end, CTM),
-    State1#msstate{cref_to_msg_ids = #{}}.
+    State1#msstate{current_file_handle = CurHdl1, cref_to_msg_ids = #{}}.
 
 flying_write(Key, #msstate { flying_ets = FlyingEts }) ->
     case ets:lookup(FlyingEts, Key) of
@@ -1285,7 +1286,7 @@ write_large_message(MsgId, MsgBodyBin,
             {CurFile, CurHdl};
         %% Flush the current file and close it. Open a new file.
         _ ->
-            ok = writer_flush(CurHdl),
+            {ok, _} = writer_flush(CurHdl),
             ok = writer_close(CurHdl),
             LargeMsgFile0 = CurFile + 1,
             {ok, LargeMsgHdl0} = writer_open(Dir, LargeMsgFile0),
@@ -1415,22 +1416,46 @@ should_mask_action(CRef, MsgId, #msstate{
     fd = file:fd(),
     %% We are only using this buffer from one pid therefore
     %% we will not acquire/release locks.
-    buffer = prim_buffer:prim_buffer()
+    buffer = prim_buffer:prim_buffer(),
+    %% io_uring ring owned by this writer. undefined when io_uring is
+    %% unavailable, in which case the standard fd path is used.
+    ring = undefined,
+    %% Raw OS fd for io_uring writes; paired with the ring above.
+    raw_fd = undefined :: integer() | undefined,
+    %% Byte offset for the next io_uring pwrite. Tracks the on-disk
+    %% position after the last flush.
+    write_offset = 0 :: non_neg_integer()
 }).
 
 -define(MAX_BUFFER_SIZE, 1048576). %% 1MB.
 
 writer_open(Dir, Num) ->
-    {ok, Fd} = file:open(form_filename(Dir, filenum_to_name(Num)),
-                         [append, binary, raw]),
-    {ok, #writer{fd = Fd, buffer = prim_buffer:new()}}.
+    Path = form_filename(Dir, filenum_to_name(Num)),
+    {ok, Fd} = file:open(Path, [append, binary, raw]),
+    case rabbit_io_uring:is_available() of
+        true ->
+            {ok, Ring} = rabbit_io_uring:create_ring(),
+            {ok, RawFd} = rabbit_io_uring:open_fd(Path),
+            {ok, #writer{fd = Fd, buffer = prim_buffer:new(),
+                         ring = Ring, raw_fd = RawFd, write_offset = 0}};
+        false ->
+            {ok, #writer{fd = Fd, buffer = prim_buffer:new()}}
+    end.
 
 writer_recover(Dir, Num, Offset) ->
-    {ok, Fd} = file:open(form_filename(Dir, filenum_to_name(Num)),
-                         [read, write, binary, raw]),
+    Path = form_filename(Dir, filenum_to_name(Num)),
+    {ok, Fd} = file:open(Path, [read, write, binary, raw]),
     {ok, Offset} = file:position(Fd, Offset),
     ok = file:truncate(Fd),
-    {ok, #writer{fd = Fd, buffer = prim_buffer:new()}}.
+    case rabbit_io_uring:is_available() of
+        true ->
+            {ok, Ring} = rabbit_io_uring:create_ring(),
+            {ok, RawFd} = rabbit_io_uring:open_fd(Path),
+            {ok, #writer{fd = Fd, buffer = prim_buffer:new(),
+                         ring = Ring, raw_fd = RawFd, write_offset = Offset}};
+        false ->
+            {ok, #writer{fd = Fd, buffer = prim_buffer:new()}}
+    end.
 
 writer_append(#writer{buffer = Buffer}, MsgId, MsgBodyBin) ->
     MsgBodyBinSize = byte_size(MsgBodyBin),
@@ -1452,19 +1477,36 @@ writer_append(#writer{buffer = Buffer}, MsgId, MsgBodyBin) ->
 
 %% Note: the message store no longer fsyncs; it only flushes data
 %% to disk. This is in line with classic queues v2 behavior.
-writer_flush(#writer{fd = Fd, buffer = Buffer}) ->
+%%
+%% Returns {ok | error_term, #writer{}} so the caller can store the
+%% updated write_offset when io_uring is in use.
+writer_flush(W = #writer{fd = Fd, buffer = Buffer, ring = undefined}) ->
     case prim_buffer:size(Buffer) of
         0 ->
-            ok;
+            {ok, W};
         Size ->
-            file:write(Fd, prim_buffer:read_iovec(Buffer, Size))
+            {file:write(Fd, prim_buffer:read_iovec(Buffer, Size)), W}
+    end;
+writer_flush(W = #writer{buffer = Buffer, ring = Ring, raw_fd = RawFd,
+                         write_offset = WOff}) ->
+    case prim_buffer:size(Buffer) of
+        0 ->
+            {ok, W};
+        Size ->
+            %% Zero-copy: pass the iovec binaries directly as separate SQEs
+            %% instead of iolist_to_binary — no extra allocation or copy.
+            IoVec = prim_buffer:read_iovec(Buffer, Size),
+            case rabbit_io_uring:writev(Ring, RawFd, IoVec, WOff) of
+                {ok, Written} -> {ok, W#writer{write_offset = WOff + Written}};
+                {error, _} = E -> {E, W}
+            end
     end.
 
 %% For large messages we don't buffer anything. Large messages
 %% are kept within their own files.
 %%
 %% This is basically the same as writer_append except no buffering.
-writer_direct_write(#writer{fd = Fd}, MsgId, MsgBodyBin) ->
+writer_direct_write(#writer{fd = Fd, ring = undefined}, MsgId, MsgBodyBin) ->
     MsgBodyBinSize = byte_size(MsgBodyBin),
     EntrySize = MsgBodyBinSize + 16, %% Size of MsgId + MsgBodyBin.
     ok = file:write(Fd, [
@@ -1473,9 +1515,20 @@ writer_direct_write(#writer{fd = Fd}, MsgId, MsgBodyBin) ->
         MsgBodyBin,
         <<255>> %% OK marker.
     ]),
+    EntrySize + 9;
+writer_direct_write(#writer{ring = Ring, raw_fd = RawFd, write_offset = WOff},
+                    MsgId, MsgBodyBin) ->
+    MsgBodyBinSize = byte_size(MsgBodyBin),
+    EntrySize = MsgBodyBinSize + 16, %% Size of MsgId + MsgBodyBin.
+    Data = <<EntrySize:64, MsgId/binary, MsgBodyBin/binary, 255>>,
+    ok = rabbit_io_uring:write(Ring, RawFd, Data, WOff),
     EntrySize + 9.
 
-writer_close(#writer{fd = Fd}) ->
+writer_close(#writer{fd = Fd, ring = undefined}) ->
+    file:close(Fd);
+writer_close(#writer{fd = Fd, ring = Ring, raw_fd = RawFd}) ->
+    ok = rabbit_io_uring:close_fd(Ring, RawFd),
+    ok = rabbit_io_uring:close_ring(Ring),
     file:close(Fd).
 
 mark_handle_open(FileHandlesEts, File, Ref) ->

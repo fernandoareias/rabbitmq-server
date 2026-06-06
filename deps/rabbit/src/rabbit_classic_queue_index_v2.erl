@@ -139,7 +139,14 @@
 
     %% File descriptors. We will keep up to 4 FDs
     %% at a time. See comments in reduce_fd_usage/2.
-    fds = #{} :: #{non_neg_integer() => file:fd()}
+    fds = #{} :: #{non_neg_integer() => file:fd()},
+
+    %% io_uring ring for this queue's index. When available, flush_buffer
+    %% uses pwritev (one io_uring_enter covers all segment writes) instead
+    %% of N individual pwrite syscalls.
+    ring = undefined :: undefined | term(),
+    %% Cached raw write fds keyed by segment, opened once and reused across flush calls.
+    raw_fds = #{} :: #{non_neg_integer() => integer()}
 }).
 
 -type state() :: #qi{}.
@@ -169,9 +176,19 @@ init(#resource{ virtual_host = VHost } = Name) ->
 init1(Name, Dir) ->
     ensure_queue_name_stub_file(Name, Dir),
     DirBin = rabbit_file:filename_to_binary(Dir),
+    Ring = case rabbit_io_uring:is_available() of
+        true ->
+            case rabbit_io_uring:create_queue_ring() of
+                {ok, R} -> R;
+                _       -> undefined
+            end;
+        false ->
+            undefined
+    end,
     #qi{
         queue_name = Name,
-        dir = << DirBin/binary, "/" >>
+        dir = << DirBin/binary, "/" >>,
+        ring = Ring
     }.
 
 ensure_queue_name_stub_file(#resource{virtual_host = VHost, name = QName}, Dir) ->
@@ -391,7 +408,8 @@ recover_segment(State, ContainsCheckFun, StoreState0, CountersRef, Fd,
 
 terminate(VHost, Terms, State0 = #qi { dir = Dir,
                                        segments = Segments,
-                                       fds = OpenFds }) ->
+                                       fds = OpenFds,
+                                       ring = Ring }) ->
     ?DEBUG("~0p ~0p ~0p", [VHost, Terms, State0]),
     %% Flush the buffer.
     State = flush_buffer(State0, full, segment_entry_count()),
@@ -400,26 +418,52 @@ terminate(VHost, Terms, State0 = #qi { dir = Dir,
         ok = file:sync(Fd),
         ok = file:close(Fd)
     end, OpenFds),
+    %% Close cached raw fds and then tear down the io_uring ring.
+    case Ring of
+        undefined ->
+            ok;
+        _ ->
+            _ = maps:map(fun(_, RawFd) ->
+                _ = rabbit_io_uring:close_fd(Ring, RawFd)
+            end, State#qi.raw_fds),
+            ok = rabbit_io_uring:close_ring(Ring)
+    end,
     %% Write recovery terms for faster recovery.
     _ = rabbit_recovery_terms:store(VHost,
                                 filename:basename(rabbit_file:binary_to_filename(Dir)),
                                 [{v2_index_state, {?VERSION, Segments}} | Terms]),
     State#qi{ segments = #{},
-              fds = #{} }.
+              fds = #{},
+              raw_fds = #{},
+              ring = undefined }.
 
 -spec delete_and_terminate(State) -> State when State::state().
 
 delete_and_terminate(State = #qi { dir = Dir,
-                                   fds = OpenFds }) ->
+                                   fds = OpenFds,
+                                   ring = Ring,
+                                   raw_fds = RawFds }) ->
     ?DEBUG("~0p", [State]),
     %% Close all FDs.
     _ = maps:map(fun(_, Fd) ->
         ok = file:close(Fd)
     end, OpenFds),
+    %% Close cached raw fds and tear down the io_uring ring.
+    case Ring of
+        undefined ->
+            ok;
+        _ ->
+            _ = maps:map(fun(_, RawFd) ->
+                _ = rabbit_io_uring:close_fd(Ring, RawFd)
+            end, RawFds),
+            ok = rabbit_io_uring:close_ring(Ring)
+    end,
     %% Erase the data on disk.
     ok = erase_index_dir(rabbit_file:binary_to_filename(Dir)),
     State#qi{ segments = #{},
-              fds = #{} }.
+              fds = #{},
+              raw_fds = #{},
+              ring = undefined }.
 
 -spec info(state()) -> [{atom(), integer()}].
 
@@ -457,7 +501,8 @@ publish(MsgId, SeqId, Location, Props, IsPersistent, ShouldConfirm,
     maybe_flush_buffer(State, SegmentEntryCount).
 
 new_segment_file(Segment, SegmentEntryCount, State = #qi{ segments = Segments }) ->
-    #qi{ fds = OpenFds } = reduce_fd_usage(Segment, State),
+    ReducedState = reduce_fd_usage(Segment, State),
+    #qi{ fds = OpenFds } = ReducedState,
     false = maps:is_key(Segment, OpenFds), %% assert
     {ok, Fd} = rabbit_file:open_eventually(
         segment_file(Segment, State),
@@ -475,8 +520,8 @@ new_segment_file(Segment, SegmentEntryCount, State = #qi{ segments = Segments })
                            ToSeqId:64/unsigned,
                            0:344 >>),
     %% Keep the file open.
-    State#qi{ segments = Segments#{Segment => 1},
-              fds = OpenFds#{Segment => Fd} }.
+    ReducedState#qi{ segments = Segments#{Segment => 1},
+                     fds = OpenFds#{Segment => Fd} }.
 
 %% We try to keep the number of FDs open at 4 at a maximum.
 %% Under normal circumstances we will end up with 1 or 2
@@ -488,7 +533,9 @@ new_segment_file(Segment, SegmentEntryCount, State = #qi{ segments = Segments })
 reduce_fd_usage(_SegmentToOpen, State = #qi{ fds = OpenFds })
         when map_size(OpenFds) < 4 ->
     State;
-reduce_fd_usage(SegmentToOpen, State = #qi{ fds = OpenFds0 }) ->
+reduce_fd_usage(SegmentToOpen, State = #qi{ fds = OpenFds0,
+                                             ring = Ring,
+                                             raw_fds = RawFds0 }) ->
     case OpenFds0 of
         #{SegmentToOpen := _} ->
             State;
@@ -516,7 +563,14 @@ reduce_fd_usage(SegmentToOpen, State = #qi{ fds = OpenFds0 }) ->
             ?DEBUG("~0p ~0p ~0p", [SegmentToOpen, OpenSegments, SegmentToClose]),
             {Fd, OpenFds} = maps:take(SegmentToClose, OpenFds0),
             ok = file:close(Fd),
-            State#qi{ fds = OpenFds }
+            RawFds = case {Ring, maps:take(SegmentToClose, RawFds0)} of
+                {_, error}          -> RawFds0;
+                {undefined, _}      -> RawFds0;
+                {_, {RawFd, Rest}}  ->
+                    _ = rabbit_io_uring:close_fd(Ring, RawFd),
+                    Rest
+            end,
+            State#qi{ fds = OpenFds, raw_fds = RawFds }
     end.
 
 maybe_mark_unconfirmed(MsgId, #message_properties{ needs_confirming = true },
@@ -564,11 +618,24 @@ flush_buffer(State0 = #qi { write_buffer = WriteBuffer0,
              AcksAcc}
     end, {#{}, #{}, #{}}, WriteBuffer0),
     %% Then we do the writes for each segment.
-    State = maps:fold(fun(Segment, LocBytes0, FoldState0) ->
+    State = maps:fold(fun(Segment, LocBytes0, FoldState0 = #qi{ring = Ring}) ->
         FoldState1 = reduce_fd_usage(Segment, FoldState0),
-        {Fd, FoldState} = get_fd_for_segment(Segment, FoldState1),
+        {Fd, FoldState2} = get_fd_for_segment(Segment, FoldState1),
         LocBytes = flush_buffer_consolidate(lists:sort(LocBytes0), 1),
-        ok = file:pwrite(Fd, LocBytes),
+        FoldState = case Ring of
+            undefined ->
+                ok = file:pwrite(Fd, LocBytes),
+                FoldState2;
+            _ ->
+                %% io_uring path: reuse a cached raw fd for this segment to avoid
+                %% open/close overhead on every flush. Consolidation may produce
+                %% iolists so we flatten each chunk to a binary first.
+                SegFile = segment_file(Segment, FoldState2),
+                {RawFd, FoldState3} = get_raw_fd_for_segment(Segment, SegFile, FoldState2),
+                LocBytesFlat = [{Off, iolist_to_binary(Data)} || {Off, Data} <- LocBytes],
+                ok = rabbit_io_uring:pwritev(Ring, RawFd, LocBytesFlat),
+                FoldState3
+        end,
         FoldState
     end, State0, Writes),
     %% Update the cache. If we are flushing the entire write buffer,
@@ -642,6 +709,18 @@ get_fd_for_segment(Segment, State = #qi{ fds = OpenFds }) ->
             {Fd, State#qi{ fds = OpenFds#{ Segment => Fd }}}
     end.
 
+%% Returns the cached raw (integer) fd for io_uring writes, opening a new one
+%% if this segment has not been seen before. The fd stays open until the
+%% segment is deleted or the queue terminates.
+get_raw_fd_for_segment(Segment, SegFile, State = #qi{raw_fds = RawFds}) ->
+    case RawFds of
+        #{Segment := RawFd} ->
+            {RawFd, State};
+        _ ->
+            {ok, RawFd} = rabbit_io_uring:open_fd(SegFile, [rdwr, creat]),
+            {RawFd, State#qi{raw_fds = RawFds#{Segment => RawFd}}}
+    end.
+
 flush_buffer_consolidate([{Offset, Data}, {NextOffset, NextData}|Tail], Num)
         when Offset + ?ENTRY_SIZE * Num =:= NextOffset ->
     flush_buffer_consolidate([{Offset, [Data, NextData]}|Tail], Num + 1);
@@ -712,14 +791,22 @@ delete_segments([], State) ->
 delete_segments([Segment|Tail], State) ->
     delete_segments(Tail, delete_segment(Segment, State)).
 
-delete_segment(Segment, State0 = #qi{ fds = OpenFds0 }) ->
+delete_segment(Segment, State0 = #qi{ fds = OpenFds0, ring = Ring, raw_fds = RawFds0 }) ->
     %% We close the open fd if any.
-    State = case maps:take(Segment, OpenFds0) of
+    State1 = case maps:take(Segment, OpenFds0) of
         {Fd, OpenFds} ->
             ok = file:close(Fd),
             State0#qi{ fds = OpenFds };
         error ->
             State0
+    end,
+    %% Close and evict the raw fd for this segment if cached.
+    State = case {Ring, maps:take(Segment, RawFds0)} of
+        {_, error}         -> State1;
+        {undefined, _}     -> State1;
+        {_, {RawFd, Rest}} ->
+            _ = rabbit_io_uring:close_fd(Ring, RawFd),
+            State1#qi{raw_fds = Rest}
     end,
     %% Then we can delete the segment file.
     case prim_file:delete(segment_file(Segment, State)) of

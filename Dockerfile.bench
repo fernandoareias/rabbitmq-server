@@ -1,0 +1,55 @@
+## Benchmark image for io_uring vs baseline comparison.
+##
+## Uses OTP 27 to avoid the horus/beam_a incompatibility present in OTP 28+.
+## The compiled plugins and NIF are copied from the host working tree, so
+## `make dist` must have been run before building this image.
+##
+## Build:
+##   docker build -f Dockerfile.bench -t rabbitmq-bench .
+##
+## Run (baseline):
+##   docker run --rm -d --name rmq --network host rabbitmq-bench
+##
+## Run (io_uring):
+##   echo "message_store.io_uring = true" > /tmp/iouring.conf
+##   docker run --rm -d --name rmq --network host \
+##     -v /tmp/iouring.conf:/etc/rabbitmq/conf.d/90-io-uring.conf \
+##     rabbitmq-bench
+
+FROM erlang:27-slim
+
+# liburing2 is the runtime shared library required by the io_uring NIF.
+# curl is used by bench_docker.sh to delete queues via the Management HTTP API.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends liburing2 curl \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN groupadd -r rabbitmq --gid 999 \
+    && useradd -r -g rabbitmq --uid 999 -d /home/rabbitmq rabbitmq \
+    && mkdir -p /opt/rabbitmq \
+                /etc/rabbitmq/conf.d \
+                /var/lib/rabbitmq/mnesia \
+                /var/log/rabbitmq \
+                /home/rabbitmq \
+    && chown -R rabbitmq:rabbitmq /var/lib/rabbitmq /var/log/rabbitmq /home/rabbitmq /etc/rabbitmq
+
+# Copy compiled artifacts from the host working tree.
+# plugins/ already contains io_uring-0.1.0/priv/io_uring_nif.so.
+COPY plugins/ /opt/rabbitmq/plugins/
+COPY sbin/    /opt/rabbitmq/sbin/
+COPY escript/ /opt/rabbitmq/escript/
+
+ENV RABBITMQ_HOME=/opt/rabbitmq
+ENV ERL_LIBS=/opt/rabbitmq/plugins
+ENV RABBITMQ_CONFIG_FILES=/etc/rabbitmq/conf.d
+ENV RABBITMQ_LOG_BASE=/var/log/rabbitmq
+ENV RABBITMQ_MNESIA_BASE=/var/lib/rabbitmq/mnesia
+ENV RABBITMQ_ENABLED_PLUGINS=rabbitmq_management
+
+RUN echo "loopback_users = none" > /etc/rabbitmq/conf.d/00-base.conf \
+    && echo "cluster_name   = benchmark" >> /etc/rabbitmq/conf.d/00-base.conf
+
+EXPOSE 5672 15672
+
+USER rabbitmq
+ENTRYPOINT ["/opt/rabbitmq/sbin/rabbitmq-server"]

@@ -1626,6 +1626,32 @@ end}.
 {mapping, "mnesia_table_loading_retry_limit", "rabbit.mnesia_table_loading_retry_limit",
     [{datatype, integer}]}.
 
+%% Whether to use io_uring for message store writes (Linux only).
+%% When enabled, write batches are submitted to the kernel via io_uring
+%% instead of standard file:write calls, reducing syscall overhead.
+%% Requires Linux kernel >= 5.1 and liburing; ignored on other platforms.
+%%
+%% {msg_store_io_uring, false}
+
+{mapping, "message_store.io_uring", "rabbit.msg_store_io_uring",
+    [
+        {datatype, {enum, [true, false]}},
+        {default, false}
+    ]}.
+
+%% Enable SQPOLL mode for io_uring rings. The kernel polls the submission
+%% queue continuously, eliminating the io_uring_enter syscall per write batch.
+%% Requires Linux >= 5.12 for unprivileged processes (older kernels need
+%% CAP_SYS_NICE). Falls back to a normal ring if SQPOLL cannot be created.
+%%
+%% {msg_store_io_uring_sqpoll, false}
+
+{mapping, "message_store.io_uring_sqpoll", "rabbit.msg_store_io_uring_sqpoll",
+    [
+        {datatype, {enum, [true, false]}},
+        {default, false}
+    ]}.
+
 {mapping, "message_store_shutdown_timeout", "rabbit.msg_store_shutdown_timeout",
     [
         {datatype, integer},

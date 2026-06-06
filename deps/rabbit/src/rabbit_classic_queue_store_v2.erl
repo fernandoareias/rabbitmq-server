@@ -102,7 +102,17 @@
     %% we are using file:pread/3 which leaves the file
     %% position undetermined.
     read_segment = undefined :: undefined | non_neg_integer(),
-    read_fd = undefined :: undefined | file:fd()
+    read_fd = undefined :: undefined | file:fd(),
+
+    %% io_uring ring for this queue. When available, flush_buffer uses
+    %% pwritev (one io_uring_enter per segment flush instead of N pwrite
+    %% syscalls) and read_many uses preadv for scatter-gather reads.
+    ring = undefined :: undefined | term(),
+    %% Cached raw write fd: opened once per segment, reused across flush calls.
+    raw_write_segment = undefined :: undefined | non_neg_integer(),
+    raw_write_fd = undefined :: undefined | integer(),
+    raw_read_segment = undefined :: undefined | non_neg_integer(),
+    raw_read_fd = undefined :: undefined | integer()
 }).
 
 -type state() :: #qs{}.
@@ -117,7 +127,16 @@ init(#resource{ virtual_host = VHost } = Name) ->
     VHostDir = rabbit_vhost:msg_store_dir_path(VHost),
     Dir = rabbit_classic_queue_index_v2:queue_dir(VHostDir, Name),
     DirBin = rabbit_file:filename_to_binary(Dir),
-    #qs{dir = << DirBin/binary, "/" >>}.
+    Ring = case rabbit_io_uring:is_available() of
+        true ->
+            case rabbit_io_uring:create_queue_ring() of
+                {ok, R} -> R;
+                _       -> undefined
+            end;
+        false ->
+            undefined
+    end,
+    #qs{dir = << DirBin/binary, "/" >>, ring = Ring}.
 
 -spec terminate(State) -> State when State::state().
 
@@ -125,11 +144,31 @@ terminate(State0 = #qs{ read_fd = ReadFd }) ->
     ?DEBUG("~0p", [State0]),
     State = flush_buffer(State0, fun(Fd) -> ok = file:sync(Fd) end),
     maybe_close_fd(ReadFd),
+    #qs{ring = Ring, raw_write_fd = RawWriteFd, raw_read_fd = RawReadFd} = State,
+    case Ring of
+        undefined ->
+            ok;
+        _ ->
+            case RawWriteFd of
+                undefined -> ok;
+                _         -> _ = rabbit_io_uring:close_fd(Ring, RawWriteFd)
+            end,
+            case RawReadFd of
+                undefined -> ok;
+                _         -> _ = rabbit_io_uring:close_fd(Ring, RawReadFd)
+            end,
+            ok = rabbit_io_uring:close_ring(Ring)
+    end,
     State#qs{ write_segment = undefined,
               write_offset = ?HEADER_SIZE,
               cache = #{},
               read_segment = undefined,
-              read_fd = undefined }.
+              read_fd = undefined,
+              ring = undefined,
+              raw_write_segment = undefined,
+              raw_write_fd = undefined,
+              raw_read_segment = undefined,
+              raw_read_fd = undefined }.
 
 maybe_close_fd(undefined) ->
     ok;
@@ -199,7 +238,7 @@ maybe_flush_buffer(State = #qs{ write_buffer_size = WriteBufferSize }) ->
 
 flush_buffer(State = #qs{ write_buffer_size = 0 }, _) ->
     State;
-flush_buffer(State0 = #qs{ write_buffer = WriteBuffer }, FsyncFun) ->
+flush_buffer(State0 = #qs{ write_buffer = WriteBuffer, ring = Ring }, FsyncFun) ->
     CheckCRC32 = check_crc32(),
     SegmentEntryCount = segment_entry_count(),
     %% First we prepare the writes sorted by segment.
@@ -207,9 +246,8 @@ flush_buffer(State0 = #qs{ write_buffer = WriteBuffer }, FsyncFun) ->
     Writes = flush_buffer_build(WriteList, CheckCRC32, SegmentEntryCount),
     %% Then we do the writes for each segment.
     State = lists:foldl(fun({Segment, LocBytes}, FoldState) ->
-        {ok, Fd} = rabbit_file:open_eventually(
-            segment_file(Segment, FoldState),
-            [read, write, raw, binary]),
+        SegFile = segment_file(Segment, FoldState),
+        {ok, Fd} = rabbit_file:open_eventually(SegFile, [read, write, raw, binary]),
         case file:position(Fd, eof) of
             {ok, 0} ->
                 %% We write the file header if it does not exist.
@@ -224,15 +262,42 @@ flush_buffer(State0 = #qs{ write_buffer = WriteBuffer }, FsyncFun) ->
              _ ->
                 ok
         end,
-        ok = file:pwrite(Fd, lists:sort(LocBytes)),
+        NewFoldState = case Ring of
+            undefined ->
+                ok = file:pwrite(Fd, lists:sort(LocBytes)),
+                FoldState;
+            _ ->
+                %% io_uring path: reuse a cached raw fd for this segment to avoid
+                %% open/close overhead on every flush call.
+                {RawFd, FoldState1} = get_raw_write_fd(Segment, SegFile, Ring, FoldState),
+                LocBytesFlat = [{Off, iolist_to_binary(Data)}
+                                || {Off, Data} <- lists:sort(LocBytes)],
+                ok = rabbit_io_uring:pwritev(Ring, RawFd, LocBytesFlat),
+                FoldState1
+        end,
         FsyncFun(Fd),
         ok = file:close(Fd),
-        FoldState
+        NewFoldState
     end, State0, Writes),
     %% Finally we move the write_buffer to the cache.
     State#qs{ write_buffer = #{},
               write_buffer_size = 0,
               cache = WriteBuffer }.
+
+%% Returns the cached raw write fd for Segment, opening a new one if the
+%% segment has changed. Closing the old fd is done here to keep the number
+%% of open raw fds at one.
+get_raw_write_fd(Segment, _SegFile, _Ring,
+                 State = #qs{raw_write_segment = Segment, raw_write_fd = RawFd})
+        when RawFd =/= undefined ->
+    {RawFd, State};
+get_raw_write_fd(Segment, SegFile, Ring, State = #qs{raw_write_fd = OldRawFd}) ->
+    case OldRawFd of
+        undefined -> ok;
+        _         -> _ = rabbit_io_uring:close_fd(Ring, OldRawFd)
+    end,
+    {ok, NewRawFd} = rabbit_io_uring:open_fd(SegFile, [rdwr, creat]),
+    {NewRawFd, State#qs{raw_write_segment = Segment, raw_write_fd = NewRawFd}}.
 
 flush_buffer_build(WriteBuffer = [{FirstSeqId, {Offset, _, _}}|_],
                    CheckCRC32, SegmentEntryCount) ->
@@ -394,15 +459,26 @@ consolidate_reads([], _, Segment, _, Acc, Segs) ->
     %% We lists:reverse/1 because we need to preserve order.
     Segs#{Segment => lists:reverse(Acc)}.
 
-read_many_from_disk(Segs, Msgs, State) ->
+read_many_from_disk(Segs, Msgs, State = #qs{ring = Ring}) ->
     %% We read from segments in reverse order because
     %% we need to control the order of returned messages.
     Keys = lists:reverse(lists:sort(maps:keys(Segs))),
     lists:foldl(fun(Segment, {Acc0, FoldState0}) ->
-        {ok, Fd, FoldState} = get_read_fd(Segment, FoldState0),
-        {ok, Bin} = file:pread(Fd, maps:get(Segment, Segs)),
-        Acc = parse_many_from_disk(Bin, Segment, FoldState, Acc0),
-        {Acc, FoldState}
+        OffsetSizes = maps:get(Segment, Segs),
+        case Ring of
+            undefined ->
+                {ok, Fd, FoldState} = get_read_fd(Segment, FoldState0),
+                {ok, Bins} = file:pread(Fd, OffsetSizes),
+                Acc = parse_many_from_disk(Bins, Segment, FoldState, Acc0),
+                {Acc, FoldState};
+            _ ->
+                %% io_uring path: scatter-gather preadv — one io_uring_enter
+                %% submits all reads for this segment simultaneously.
+                {FoldState, RawFd} = get_raw_read_fd(Segment, FoldState0),
+                {ok, Bins} = rabbit_io_uring:preadv(Ring, RawFd, OffsetSizes),
+                Acc = parse_many_from_disk(Bins, Segment, FoldState, Acc0),
+                {Acc, FoldState}
+        end
     end, {Msgs, State}, Keys).
 
 parse_many_from_disk([<<Size:32/unsigned, _:7, UseCRC32:1, CRC32Expected:16/bits,
@@ -454,6 +530,24 @@ get_read_fd(Segment, State = #qs{ read_fd = OldFd }) ->
             {{error, no_file}, State#qs{ read_segment = undefined,
                                          read_fd = undefined }}
     end.
+
+%% Returns the raw (integer) fd for io_uring preadv reads, opening it if
+%% not already open or if the segment changed.
+%% Uses a dedicated raw_read_segment field to avoid aliasing with the
+%% Erlang read_fd's read_segment, which would cause get_read_fd/2 to
+%% return fd=undefined when the two share the same segment.
+get_raw_read_fd(Segment, State = #qs{ raw_read_segment = Segment,
+                                      raw_read_fd = RawFd })
+        when RawFd =/= undefined ->
+    {State, RawFd};
+get_raw_read_fd(Segment, State = #qs{ ring = Ring, raw_read_fd = OldRawFd }) ->
+    case OldRawFd of
+        undefined -> ok;
+        _         -> _ = rabbit_io_uring:close_fd(Ring, OldRawFd)
+    end,
+    SegFile = segment_file(Segment, State),
+    {ok, RawFd} = rabbit_io_uring:open_fd(SegFile, [rdonly]),
+    {State#qs{ raw_read_segment = Segment, raw_read_fd = RawFd }, RawFd}.
 
 -spec check_msg_on_disk(rabbit_variable_queue:seq_id(), msg_location(), State)
         -> {ok | {error, any()}, State} when State::state().
