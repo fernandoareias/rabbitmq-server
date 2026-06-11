@@ -107,6 +107,10 @@
           file_size_limit,
           %% client ref to synced messages mapping
           cref_to_msg_ids,
+          %% client ref to msg ids mapping for the in-flight io_uring
+          %% flush submitted on the previous sync, awaiting drain.
+          %% Always empty when the writer doesn't use io_uring.
+          deferred_confirms,
           %% See CREDIT_DISC_BOUND in rabbit.hrl
           credit_disc_bound
         }).
@@ -139,6 +143,27 @@
           file,
           offset
         }).
+
+-record(writer, {
+    fd = file:fd(),
+    %% We are only using this buffer from one pid therefore
+    %% we will not acquire/release locks.
+    buffer = prim_buffer:prim_buffer(),
+    %% io_uring ring owned by this writer. undefined when io_uring is
+    %% unavailable, in which case the standard fd path is used.
+    ring = undefined,
+    %% Raw OS fd for io_uring writes; paired with the ring above.
+    raw_fd = undefined :: integer() | undefined,
+    %% Byte offset for the next io_uring pwrite. Tracks the on-disk
+    %% position after the last flush.
+    write_offset = 0 :: non_neg_integer(),
+    %% Number of CQEs (writes + fdatasync) submitted by the last
+    %% writer_flush_async/1 call that haven't been collected yet via
+    %% writer_drain/1. 0 when nothing is in flight.
+    pending_cqes = 0 :: non_neg_integer()
+}).
+
+-define(MAX_BUFFER_SIZE, 1048576). %% 1MB.
 
 %%----------------------------------------------------------------------------
 
@@ -784,6 +809,7 @@ init([VHost, Type, BaseDir, ClientRefs, StartupFunState]) ->
                        successfully_recovered = CleanShutdown,
                        file_size_limit        = FileSizeLimit,
                        cref_to_msg_ids        = #{},
+                       deferred_confirms       = #{},
                        credit_disc_bound      = CreditDiscBound
                      },
     %% If we didn't recover the msg location index then we need to
@@ -977,7 +1003,7 @@ terminate(Reason, State = #msstate { index_ets           = IndexEts,
     ok = rabbit_msg_store_gc:stop(GCPid),
     State3 = case CurHdl of
                  undefined -> State;
-                 _         -> State2 = internal_sync(State),
+                 _         -> State2 = internal_sync_and_drain(State),
                               ok = writer_close(CurHdl),
                               State2
              end,
@@ -1014,8 +1040,10 @@ format_message_queue(Opt, MQ) -> rabbit_misc:format_message_queue(Opt, MQ).
 %%----------------------------------------------------------------------------
 
 clear_client(CRef, State = #msstate { cref_to_msg_ids = CTM,
+                                      deferred_confirms = Pending,
                                       dying_clients = DyingClients }) ->
     State #msstate { cref_to_msg_ids = maps:remove(CRef, CTM),
+                     deferred_confirms = maps:remove(CRef, Pending),
                      dying_clients = maps:remove(CRef, DyingClients) }.
 
 noreply(State) ->
@@ -1027,15 +1055,17 @@ reply(Reply, State) ->
     {reply, Reply, State1, Timeout}.
 
 next_state(State = #msstate { sync_timer_ref  = undefined,
-                              cref_to_msg_ids = CTM }) ->
-    case maps:size(CTM) of
-        0 -> {State, hibernate};
-        _ -> {start_sync_timer(State), 0}
+                              cref_to_msg_ids = CTM,
+                              deferred_confirms = Pending }) ->
+    case maps:size(CTM) =:= 0 andalso maps:size(Pending) =:= 0 of
+        true  -> {State, hibernate};
+        false -> {start_sync_timer(State), 0}
     end;
-next_state(State = #msstate { cref_to_msg_ids = CTM }) ->
-    case maps:size(CTM) of
-        0 -> {stop_sync_timer(State), hibernate};
-        _ -> {State, 0}
+next_state(State = #msstate { cref_to_msg_ids = CTM,
+                              deferred_confirms = Pending }) ->
+    case maps:size(CTM) =:= 0 andalso maps:size(Pending) =:= 0 of
+        true  -> {stop_sync_timer(State), hibernate};
+        false -> {State, 0}
     end.
 
 start_sync_timer(State) ->
@@ -1045,21 +1075,77 @@ start_sync_timer(State) ->
 stop_sync_timer(State) ->
     rabbit_misc:stop_timer(State, #msstate.sync_timer_ref).
 
-internal_sync(State = #msstate { current_file_handle = CurHdl,
-                                 clients             = Clients,
-                                 cref_to_msg_ids     = CTM }) ->
-    State1 = stop_sync_timer(State),
-    {ok, CurHdl1} = writer_flush(CurHdl),
-    %% We confirm all pending messages because we know they are
-    %% either on disk when we flush the current write file; or
-    %% were removed by the queue already.
+%% We confirm pending messages because we know they are either on disk
+%% when we flush the current write file; or were removed by the queue
+%% already.
+confirm_pending(CTM, Clients) ->
     maps:foreach(fun (CRef, MsgIds) ->
         case maps:get(CRef, Clients) of
             {_CPid, undefined   } -> ok;
             {_CPid, MsgOnDiskFun} -> MsgOnDiskFun(MsgIds, written)
         end
-    end, CTM),
+    end, CTM).
+
+%% Flushes the current write file and confirms all messages written
+%% since the last sync.
+%%
+%% For the non-io_uring writer, writer_flush_async/1 is itself
+%% synchronous, so this confirms immediately. For the io_uring writer,
+%% this drains and confirms the *previous* sync's flush, then submits
+%% the current buffer asynchronously, deferring confirmation of these
+%% messages to the next sync (see internal_sync_pipelined/1).
+internal_sync(State = #msstate{current_file_handle = #writer{ring = undefined}}) ->
+    internal_sync_sync(State);
+internal_sync(State) ->
+    internal_sync_pipelined(State).
+
+%% Same as internal_sync/1, but additionally drains any in-flight flush
+%% and waits for the current flush to complete, leaving the writer with
+%% nothing in flight and no deferred confirms. Must be used wherever the
+%% writer is about to be closed (file rollover, large message, shutdown).
+internal_sync_and_drain(State = #msstate{current_file_handle = #writer{ring = undefined}}) ->
+    internal_sync_sync(State);
+internal_sync_and_drain(State) ->
+    internal_sync_drain_then_sync(State).
+
+internal_sync_sync(State = #msstate{current_file_handle = CurHdl,
+                                    clients             = Clients,
+                                    cref_to_msg_ids     = CTM}) ->
+    State1 = stop_sync_timer(State),
+    {ok, CurHdl1} = writer_flush_async(CurHdl),
+    confirm_pending(CTM, Clients),
     State1#msstate{current_file_handle = CurHdl1, cref_to_msg_ids = #{}}.
+
+internal_sync_pipelined(State = #msstate{current_file_handle = CurHdl,
+                                         clients             = Clients,
+                                         cref_to_msg_ids     = CTM,
+                                         deferred_confirms    = Pending}) ->
+    State1 = stop_sync_timer(State),
+    %% Collect the CQEs from the flush submitted on the previous sync (if
+    %% any) and confirm those messages -- they are now durable on disk.
+    {ok, CurHdl1} = writer_drain(CurHdl),
+    confirm_pending(Pending, Clients),
+    %% Submit the current buffer for write+fdatasync without waiting.
+    {ok, CurHdl2} = writer_flush_async(CurHdl1),
+    {NewPending, ImmediateCTM} = case CurHdl2#writer.pending_cqes of
+        0 -> {#{}, CTM}; %% Nothing submitted; nothing to wait for.
+        _ -> {CTM, #{}}  %% Defer confirmation until the CQEs are drained.
+    end,
+    confirm_pending(ImmediateCTM, Clients),
+    State1#msstate{current_file_handle = CurHdl2, cref_to_msg_ids = #{},
+                   deferred_confirms = NewPending}.
+
+internal_sync_drain_then_sync(State = #msstate{current_file_handle = CurHdl,
+                                               clients             = Clients,
+                                               cref_to_msg_ids     = CTM,
+                                               deferred_confirms    = Pending}) ->
+    State1 = stop_sync_timer(State),
+    {ok, CurHdl1} = writer_drain(CurHdl),
+    confirm_pending(Pending, Clients),
+    {ok, CurHdl2} = writer_flush_sync(CurHdl1),
+    confirm_pending(CTM, Clients),
+    State1#msstate{current_file_handle = CurHdl2, cref_to_msg_ids = #{},
+                   deferred_confirms = #{}}.
 
 flying_write(Key, #msstate { flying_ets = FlyingEts }) ->
     case ets:lookup(FlyingEts, Key) of
@@ -1252,7 +1338,7 @@ flush_or_roll_to_new_file(
                      cur_file_cache_ets  = CurFileCacheEts,
                      file_size_limit     = FileSizeLimit })
   when Offset >= FileSizeLimit ->
-    State1 = internal_sync(State),
+    State1 = internal_sync_and_drain(State),
     ok = writer_close(CurHdl),
     NextFile = CurFile + 1,
     {ok, NextHdl} = writer_open(Dir, NextFile),
@@ -1286,7 +1372,7 @@ write_large_message(MsgId, MsgBodyBin,
             {CurFile, CurHdl};
         %% Flush the current file and close it. Open a new file.
         _ ->
-            {ok, _} = writer_flush(CurHdl),
+            {ok, _} = writer_flush_sync(CurHdl),
             ok = writer_close(CurHdl),
             LargeMsgFile0 = CurFile + 1,
             {ok, LargeMsgHdl0} = writer_open(Dir, LargeMsgFile0),
@@ -1331,7 +1417,7 @@ write_large_message(MsgId, MsgBodyBin,
     %% Delete messages from the cache that were written to disk.
     true = ets:match_delete(CurFileCacheEts, {'_', '_', 0}),
     %% Process confirms (this won't flush; we already did) and continue.
-    State = internal_sync(State1),
+    State = internal_sync_and_drain(State1),
     State #msstate { current_file_handle = NextHdl,
                      current_file        = NextFile,
                      current_file_offset = 0 }.
@@ -1412,23 +1498,6 @@ should_mask_action(CRef, MsgId, #msstate{
 %% file helper functions
 %%----------------------------------------------------------------------------
 
--record(writer, {
-    fd = file:fd(),
-    %% We are only using this buffer from one pid therefore
-    %% we will not acquire/release locks.
-    buffer = prim_buffer:prim_buffer(),
-    %% io_uring ring owned by this writer. undefined when io_uring is
-    %% unavailable, in which case the standard fd path is used.
-    ring = undefined,
-    %% Raw OS fd for io_uring writes; paired with the ring above.
-    raw_fd = undefined :: integer() | undefined,
-    %% Byte offset for the next io_uring pwrite. Tracks the on-disk
-    %% position after the last flush.
-    write_offset = 0 :: non_neg_integer()
-}).
-
--define(MAX_BUFFER_SIZE, 1048576). %% 1MB.
-
 writer_open(Dir, Num) ->
     Path = form_filename(Dir, filenum_to_name(Num)),
     {ok, Fd} = file:open(Path, [append, binary, raw]),
@@ -1475,31 +1544,65 @@ writer_append(#writer{buffer = Buffer}, MsgId, MsgBodyBin) ->
     end,
     {Res, EntrySize + 9}. %% EntrySize + size field + OK marker.
 
-%% Note: the message store no longer fsyncs; it only flushes data
-%% to disk. This is in line with classic queues v2 behavior.
+%% Submits the current buffer for write+fdatasync.
 %%
-%% Returns {ok | error_term, #writer{}} so the caller can store the
-%% updated write_offset when io_uring is in use.
-writer_flush(W = #writer{fd = Fd, buffer = Buffer, ring = undefined}) ->
+%% For the non-io_uring writer this performs the write and fdatasync
+%% synchronously, as before. For the io_uring writer, the linked
+%% write+fdatasync SQEs are submitted without waiting for the CQEs;
+%% pending_cqes is set to the number of CQEs the caller must later
+%% collect via writer_drain/1, which must happen before the next
+%% writer_flush_async/1 call or before writer_close/1.
+%%
+%% Returns {ok | error_term, #writer{}}.
+writer_flush_async(W = #writer{fd = Fd, buffer = Buffer, ring = undefined}) ->
     case prim_buffer:size(Buffer) of
         0 ->
             {ok, W};
         Size ->
-            {file:write(Fd, prim_buffer:read_iovec(Buffer, Size)), W}
-    end;
-writer_flush(W = #writer{buffer = Buffer, ring = Ring, raw_fd = RawFd,
-                         write_offset = WOff}) ->
-    case prim_buffer:size(Buffer) of
-        0 ->
-            {ok, W};
-        Size ->
-            %% Zero-copy: pass the iovec binaries directly as separate SQEs
-            %% instead of iolist_to_binary — no extra allocation or copy.
-            IoVec = prim_buffer:read_iovec(Buffer, Size),
-            case rabbit_io_uring:writev(Ring, RawFd, IoVec, WOff) of
-                {ok, Written} -> {ok, W#writer{write_offset = WOff + Written}};
+            case file:write(Fd, prim_buffer:read_iovec(Buffer, Size)) of
+                ok             -> {file:datasync(Fd), W};
                 {error, _} = E -> {E, W}
             end
+    end;
+writer_flush_async(W = #writer{buffer = Buffer, ring = Ring, raw_fd = RawFd,
+                               write_offset = WOff, pending_cqes = 0}) ->
+    case prim_buffer:size(Buffer) of
+        0 ->
+            {ok, W};
+        Size ->
+            %% Zero-copy: pass the iovec binaries as linked write SQEs
+            %% followed by a chained fdatasync SQE in one io_uring_enter.
+            IoVec = prim_buffer:read_iovec(Buffer, Size),
+            case rabbit_io_uring:writev_fdatasync_async(Ring, RawFd, IoVec, WOff) of
+                {ok, NumCqes, Written} ->
+                    {ok, W#writer{write_offset = WOff + Written,
+                                  pending_cqes = NumCqes}};
+                {error, _} = E -> {E, W}
+            end
+    end.
+
+%% Collects the CQEs from the previous writer_flush_async/1 call, if any.
+%% No-op when nothing is in flight (including for the non-io_uring writer).
+writer_drain(W = #writer{ring = undefined}) ->
+    {ok, W};
+writer_drain(W = #writer{pending_cqes = 0}) ->
+    {ok, W};
+writer_drain(W = #writer{ring = Ring, pending_cqes = N}) ->
+    case rabbit_io_uring:drain_fdatasync(Ring, N) of
+        ok             -> {ok, W#writer{pending_cqes = 0}};
+        {error, _} = E -> E
+    end.
+
+%% Drains any in-flight flush, then flushes the current buffer and waits
+%% for it to complete. Used wherever the writer is about to be closed, as
+%% no SQEs can be left in flight on a ring that's about to be torn down.
+writer_flush_sync(W = #writer{ring = undefined}) ->
+    writer_flush_async(W);
+writer_flush_sync(W0) ->
+    {ok, W1} = writer_drain(W0),
+    case writer_flush_async(W1) of
+        {ok, W2}        -> writer_drain(W2);
+        {error, _} = E  -> E
     end.
 
 %% For large messages we don't buffer anything. Large messages

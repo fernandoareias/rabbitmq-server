@@ -19,6 +19,11 @@
 %%               to the kernel without an extra user-space copy.
 %%   pwritev/3 — scatter write: list of {Offset, Binary} pairs, one submit.
 %%               Replaces file:pwrite/2 in the queue store / index flush paths.
+%%   writev_fdatasync_async/4 — like writev/4 but chains a linked fdatasync
+%%               SQE after the writes and returns without waiting; pair
+%%               with drain_fdatasync/2 to collect the CQEs once durable.
+%%   drain_fdatasync/2 — collects the CQEs from a prior
+%%               writev_fdatasync_async/4 call.
 %%
 %% Read path (scatter gather)
 %%   preadv/3  — scatter gather pread: list of {Offset, Size} pairs per fd,
@@ -38,6 +43,7 @@
 -export([create_ring/0, create_ring/1, create_queue_ring/0, close_ring/1]).
 -export([open_fd/1, open_fd/2, close_fd/2]).
 -export([write/4, writev/4, pwritev/3]).
+-export([writev_fdatasync_async/4, drain_fdatasync/2]).
 -export([preadv/3]).
 
 -include_lib("kernel/include/logger.hrl").
@@ -61,7 +67,7 @@ start() ->
 
 -spec stop() -> ok.
 stop() ->
-    catch persistent_term:erase(?AVAILABLE_KEY),
+    try persistent_term:erase(?AVAILABLE_KEY) catch _:_ -> ok end,
     ok.
 
 -spec is_available() -> boolean().
@@ -168,6 +174,40 @@ writev(Ring, RawFd, IoVec, StartOffset) ->
         ok          -> {ok, TotalSize};
         {error, _} = E -> E
     end.
+
+%% Like writev/4 but appends an fdatasync SQE linked to the writes so the
+%% kernel only runs fdatasync after all writes complete, and submits
+%% without waiting for the CQEs. The caller may go on to do other work
+%% and must later call drain_fdatasync/2 with the returned CQE count,
+%% before submitting another batch on the same ring or tearing it down.
+%%
+%% Each write SQE carries IOSQE_IO_LINK so it is chained to the next;
+%% the fdatasync SQE has no link flag and terminates the chain.
+-spec writev_fdatasync_async(ring(), raw_fd(), [binary()], non_neg_integer()) ->
+    {ok, non_neg_integer(), non_neg_integer()} | {error, term()}.
+writev_fdatasync_async(_Ring, _RawFd, [], _StartOffset) ->
+    {ok, 0, 0};
+writev_fdatasync_async(Ring, RawFd, IoVec, StartOffset) ->
+    {N, _} = lists:foldl(
+        fun(Bin, {Count, Off}) ->
+            Ref = make_ref(),
+            ok = io_uring:prep_linked(Ring, Ref, {write, RawFd, Bin, Off}),
+            {Count + 1, Off + byte_size(Bin)}
+        end, {0, StartOffset}, IoVec),
+    FsyncRef = make_ref(),
+    ok = io_uring:prep(Ring, FsyncRef, {fdatasync, RawFd}),
+    {ok, _} = io_uring:submit(Ring),
+    TotalSize = lists:foldl(fun(B, Acc) -> Acc + byte_size(B) end, 0, IoVec),
+    {ok, N + 1, TotalSize}.
+
+%% Collects the NumCqes CQEs produced by a prior writev_fdatasync_async/4
+%% call. check_write_results treats any negative res (including -ECANCELED
+%% on chain failure) as an error.
+-spec drain_fdatasync(ring(), non_neg_integer()) -> ok | {error, term()}.
+drain_fdatasync(_Ring, 0) ->
+    ok;
+drain_fdatasync(Ring, NumCqes) ->
+    collect_n_cqes(Ring, NumCqes).
 
 %% Scatter write: list of {FileOffset, Binary} pairs.
 %% Replaces file:pwrite(Fd, [{Offset, Data}]) in flush_buffer paths.

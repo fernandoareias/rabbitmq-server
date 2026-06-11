@@ -1,30 +1,55 @@
 #!/usr/bin/env bash
 ##
-## bench_statistical.sh — 30 runs cada (baseline vs io_uring) + análise estatística.
+## bench_statistical.sh — dual-broker interleaved: baseline e io_uring sobem
+## simultaneamente, sem restart entre pares. Elimina cold start por completo.
 ##
 ## Uso:
-##   bash bench_statistical.sh              # 30 runs × 10s, 4 prod, 1 KB
-##   bash bench_statistical.sh 20 10 2048   # 20 runs × 10s, 10 prod, 2 KB
+##   bash bench_statistical.sh              # 30 pares × 10s, 4 prod, 1 KB
+##   bash bench_statistical.sh 20 10 4 2048 # 20 pares × 10s, 4 prod, 2 KB
 ##
 set -euo pipefail
+
+# Ensure Erlang 27 (required by RabbitMQ 4.x; OTP 29 breaks Horus).
+# Activate kerl if the current erl is not OTP 27.x.
+_otp_release=$(erl -eval 'io:format("~s",[erlang:system_info(otp_release)]),halt().' -noshell 2>/dev/null || echo "unknown")
+if [[ "$_otp_release" != 27* ]]; then
+    _kerl_activate="${HOME}/.kerl/installs/27.3.4.12-rabbitmq/activate"
+    [[ -f "$_kerl_activate" ]] || { printf '[bench] ERROR: OTP %s detectado e kerl 27 não encontrado em %s\n' "$_otp_release" "$_kerl_activate" >&2; exit 1; }
+    # shellcheck source=/dev/null
+    # Disable -u temporarily: the kerl activate script references variables
+    # that may be unset, which would abort the script under set -u.
+    set +u
+    source "$_kerl_activate"
+    set -u
+    printf '[bench] Ativado Erlang %s via kerl (era OTP %s).\n' \
+        "$(erl -eval 'io:format("~s",[erlang:system_info(otp_release)]),halt().' -noshell 2>/dev/null)" \
+        "$_otp_release"
+fi
+unset _otp_release _kerl_activate
 
 BENCH_ROOT="$(cd "$(dirname "$0")" && pwd)"
 RUNS="${1:-30}"
 DURATION="${2:-10}"     # segundos por run
 PRODUCERS="${3:-4}"
 MSG_SIZE="${4:-1024}"
+WARMUP_PAIRS="${5:-3}"  # pares descartados para aquecer ambos os stores
 
 PERF_TEST_JAR="$BENCH_ROOT/perf-test.jar"
 RABBITMQCTL="$BENCH_ROOT/escript/rabbitmqctl"
+RABBITMQ_SERVER="$BENCH_ROOT/sbin/rabbitmq-server"
 export ERL_LIBS="$BENCH_ROOT/plugins"
 
 HOSTNAME_SHORT=$(hostname -s)
-NODE_NAME="rabbit@${HOSTNAME_SHORT}"
-# Match the TEST_TMPDIR the Makefile computes: $TMPDIR/rabbitmq-test-instances.
 TEST_TMPDIR="${TMPDIR:-/tmp}/rabbitmq-test-instances"
-NODE_DIR="${TEST_TMPDIR}/${NODE_NAME}"
-CONF_DIR="${TEST_TMPDIR}/conf.d"
-IO_URING_CONF="${CONF_DIR}/90-io-uring.conf"
+
+NODE_BASELINE="rabbit-b@${HOSTNAME_SHORT}"
+NODE_IOURING="rabbit-u@${HOSTNAME_SHORT}"
+PORT_BASELINE=5672
+PORT_IOURING=5673
+DIR_BASELINE="${TEST_TMPDIR}/rabbit-b@${HOSTNAME_SHORT}"
+DIR_IOURING="${TEST_TMPDIR}/rabbit-u@${HOSTNAME_SHORT}"
+CONF_BASELINE="${TEST_TMPDIR}/conf-baseline"
+CONF_IOURING="${TEST_TMPDIR}/conf-iouring"
 
 RESULT_DIR="$BENCH_ROOT/bench-results"
 BASELINE_CSV="$RESULT_DIR/baseline.csv"
@@ -35,24 +60,14 @@ QUEUE_NAME="bench-stat"
 
 ##------------------------------------------------------------------------
 log()  { printf '[bench] %s\n' "$*"; }
-die()  { printf '[bench] ERROR: %s\n' "$*" >&2; stop_broker; exit 1; }
+die()  { printf '[bench] ERROR: %s\n' "$*" >&2; stop_all_nodes; exit 1; }
 bar()  { printf '[bench] ─────────────────────────────────────────────\n'; }
 
 ##------------------------------------------------------------------------
-generate_conf() {
-    mkdir -p "$CONF_DIR"
-    printf '%s\n' \
-        "loopback_users = none" \
-        "cluster_name = localhost" \
-        "raft.data_dir = ${NODE_DIR}/mnesia/${NODE_NAME}/quorum" \
-        > "${CONF_DIR}/00-base.conf"
-}
-
-# Pre-populate feature_flags so the broker skips migrations that trigger a
-# known horus compilation bug (tie_binding_to_dest_with_keep_while_cond).
 prefill_feature_flags() {
-    mkdir -p "$NODE_DIR"
-    cat > "${NODE_DIR}/feature_flags" <<'EOF'
+    local data_dir="$1"
+    mkdir -p "$data_dir"
+    cat > "${data_dir}/feature_flags" <<'EOF'
 [classic_mirrored_queue_version,
  classic_queue_type_delivery_support,
  detailed_queues_endpoint,
@@ -86,64 +101,86 @@ prefill_feature_flags() {
  user_limits,
  virtual_host_metadata].
 EOF
-    log "feature_flags pré-populado em ${NODE_DIR}/feature_flags"
 }
 
-start_broker() {
-    local label="$1"
-    local enable_io_uring="${2:-false}"
+start_node() {
+    local node="$1" port="$2" data_dir="$3" conf_dir="$4" io_uring="$5"
+    local mgmt_port=$(( port + 10000 ))
+    log "Iniciando $node (AMQP :$port, management :$mgmt_port)..."
 
-    log "Iniciando broker ($label)..."
-    make -C "$BENCH_ROOT" virgin-test-tmpdir > /dev/null 2>&1
-    generate_conf
-    prefill_feature_flags
+    mkdir -p "$data_dir" "$conf_dir"
 
-    if [[ "$enable_io_uring" == "true" ]]; then
-        printf 'message_store.io_uring = true\n' > "$IO_URING_CONF"
-        log "io_uring habilitado."
+    # Pre-populate feature flags to skip migrations that trigger a known
+    # Horus compilation bug (tie_binding_to_dest_with_keep_while_cond).
+    prefill_feature_flags "$data_dir"
+
+    printf '%s\n' \
+        "loopback_users = none" \
+        "cluster_name = localhost" \
+        "management.tcp.port = ${mgmt_port}" \
+        "raft.data_dir = ${data_dir}/mnesia/${node}/quorum" \
+        > "${conf_dir}/00-base.conf"
+
+    if [[ "$io_uring" == "true" ]]; then
+        printf 'message_store.io_uring = true\n' > "${conf_dir}/90-io-uring.conf"
+        log "  io_uring habilitado."
     fi
 
-    # Export as environment variable so the broker process inherits it.
-    # Passing as a Make variable (FOO=bar make) does NOT propagate to
-    # subshell commands in recipes — env export is required.
-    RABBITMQ_CONFIG_FILES="$CONF_DIR" \
-        make -C "$BENCH_ROOT" run-background-broker \
-        >> "$RESULT_DIR/broker-${label}.log" 2>&1
+    RABBITMQ_NODENAME="$node" \
+    RABBITMQ_NODE_PORT="$port" \
+    RABBITMQ_BASE="$data_dir" \
+    RABBITMQ_PID_FILE="${data_dir}/${node}.pid" \
+    RABBITMQ_LOG_BASE="${data_dir}/log" \
+    RABBITMQ_MNESIA_BASE="${data_dir}/mnesia" \
+    RABBITMQ_MNESIA_DIR="${data_dir}/mnesia/${node}" \
+    RABBITMQ_QUORUM_DIR="${data_dir}/mnesia/${node}/quorum" \
+    RABBITMQ_STREAM_DIR="${data_dir}/mnesia/${node}/stream" \
+    RABBITMQ_FEATURE_FLAGS_FILE="${data_dir}/feature_flags" \
+    RABBITMQ_PLUGINS_DIR="$BENCH_ROOT/plugins" \
+    RABBITMQ_PLUGINS_EXPAND_DIR="${data_dir}/plugins" \
+    RABBITMQ_ENABLED_PLUGINS_FILE="${data_dir}/enabled_plugins" \
+    RABBITMQ_ENABLED_PLUGINS="rabbitmq_management" \
+    RABBITMQ_SERVER_START_ARGS="" \
+    RABBITMQ_CONFIG_FILES="$conf_dir" \
+    ERL_LIBS="$BENCH_ROOT/plugins" \
+        "$RABBITMQ_SERVER" -detached \
+        >> "$RESULT_DIR/broker-${node}.log" 2>&1
 
-    log "Aguardando startup (máx 90s)..."
+    log "  Aguardando startup (máx 90s)..."
     local deadline=$(( $(date +%s) + 90 ))
-    until "$RABBITMQCTL" -n "$NODE_NAME" await_startup > /dev/null 2>&1; do
-        (( $(date +%s) > deadline )) && die "Broker não ficou pronto em 90s."
+    until "$RABBITMQCTL" -n "$node" await_startup > /dev/null 2>&1; do
+        (( $(date +%s) > deadline )) && die "Broker $node não ficou pronto em 90s."
         sleep 2
     done
-    log "Broker pronto."
+    log "  $node pronto."
 }
 
-stop_broker() {
-    log "Parando broker..."
-    make -C "$BENCH_ROOT" stop-node > /dev/null 2>&1 || true
-    local deadline=$(( $(date +%s) + 30 ))
-    while [[ -f "${NODE_DIR}/${NODE_NAME}.pid" ]]; do
-        (( $(date +%s) > deadline )) && break
-        sleep 1
-    done
-    rm -f "$IO_URING_CONF"
+stop_node() {
+    local node="$1"
+    log "Parando $node..."
+    "$RABBITMQCTL" -n "$node" stop > /dev/null 2>&1 || true
     sleep 2
 }
 
+stop_all_nodes() {
+    stop_node "$NODE_BASELINE" 2>/dev/null || true
+    stop_node "$NODE_IOURING"  2>/dev/null || true
+}
+
 ##------------------------------------------------------------------------
-delete_queue() {
+delete_queue_on() {
+    local mgmt_port="$1"
     curl -s -u guest:guest \
-        -X DELETE "http://localhost:15672/api/queues/%2F/${QUEUE_NAME}" \
+        -X DELETE "http://localhost:${mgmt_port}/api/queues/%2F/${QUEUE_NAME}" \
         > /dev/null 2>&1 || true
 }
 
-run_once() {
-    local run_num="$1"
+run_once_on() {
+    local uri="$1" mgmt_port="$2" run_num="$3"
     local tmp_out="/tmp/bench-run-${run_num}.txt"
 
     java -jar "$PERF_TEST_JAR" \
-        --uri "amqp://guest:guest@localhost:5672" \
+        --uri "$uri" \
         --queue "$QUEUE_NAME" \
         --queue-args "x-max-length=2000000" \
         --producers  "$PRODUCERS" \
@@ -162,82 +199,104 @@ run_once() {
         | tail -1 | grep -oP '\d+(?=\s*µs)' | tail -1 || echo "")
 
     if [[ -z "$throughput" || -z "$p99" ]]; then
-        printf >&2 '[bench]   Run %d: parse falhou, descartando.\n' "$run_num"
+        printf >&2 '[bench]   Run %s: parse falhou, descartando.\n' "$run_num"
         cat "$tmp_out" >> "$RESULT_DIR/parse-errors.log"
         return 1
     fi
 
-    # Progresso para stderr; CSV para stdout (capturado pelo caller)
-    printf >&2 '[bench]   run %-3d  %s msg/s  p99=%s µs\n' \
+    printf >&2 '[bench]   run %-4s  %s msg/s  p99=%s µs\n' \
         "$run_num" "$throughput" "$p99"
     printf '%s,%s\n' "$throughput" "$p99"
 
-    delete_queue
+    delete_queue_on "$mgmt_port"
     sleep 1
 }
 
-collect_runs() {
-    local label="$1"
-    local csv_file="$2"
-
-    bar
-    log "Coletando $RUNS runs — $label"
-    bar
-
-    # Warmup (descartado)
-    log "Warmup run (descartado)..."
-    local tmp_warmup="/tmp/bench-warmup.txt"
+run_warmup_on() {
+    local uri="$1" mgmt_port="$2"
+    local tmp_warmup="/tmp/bench-warmup-${mgmt_port}.txt"
     java -jar "$PERF_TEST_JAR" \
-        --uri "amqp://guest:guest@localhost:5672" \
+        --uri "$uri" \
         --queue "$QUEUE_NAME" \
         --queue-args "x-max-length=2000000" \
         --producers "$PRODUCERS" --consumers 0 \
         --flag persistent --size "$MSG_SIZE" \
         --confirm 200 --time "$DURATION" \
         > "$tmp_warmup" 2>&1 || true
-    delete_queue
-    sleep 2
+    # Do not delete the queue here: accumulated messages remain on disk
+    # so the next run_once_on() measures writes to an already-populated store.
+    sleep 1
+}
 
-    # Limpa CSV anterior
-    > "$csv_file"
+run_pair() {
+    local pair_num="$1"
+    bar
+    log "Par $pair_num/$RUNS"
+    bar
 
-    local done=0 attempt=0
-    while (( done < RUNS )); do
+    local line attempt
+
+    # Baseline — broker já está warm, store tem dados do par anterior
+    attempt=0
+    while (( attempt < 3 )); do
         attempt=$(( attempt + 1 ))
-        if (( attempt > RUNS * 2 )); then
-            log "Muitas falhas. Abortando."
-            break
-        fi
-        local csv_line
-        if csv_line=$(run_once "$attempt"); then
-            echo "$csv_line" >> "$csv_file"
-            done=$(( done + 1 ))
-        fi
+        if line=$(run_once_on \
+                "amqp://guest:guest@localhost:${PORT_BASELINE}" \
+                "$(( PORT_BASELINE + 10000 ))" \
+                "b${pair_num}"); then break; fi
+        line=""
     done
-    log "Coleta finalizada: $done runs em $csv_file"
+    [[ -n "$line" ]] || die "Baseline run $pair_num falhou após 3 tentativas."
+    echo "$line" >> "$BASELINE_CSV"
+
+    # io_uring — idem
+    attempt=0
+    while (( attempt < 3 )); do
+        attempt=$(( attempt + 1 ))
+        if line=$(run_once_on \
+                "amqp://guest:guest@localhost:${PORT_IOURING}" \
+                "$(( PORT_IOURING + 10000 ))" \
+                "i${pair_num}"); then break; fi
+        line=""
+    done
+    [[ -n "$line" ]] || die "io_uring run $pair_num falhou após 3 tentativas."
+    echo "$line" >> "$IOURING_CSV"
 }
 
 ##------------------------------------------------------------------------
 main() {
-    [[ -f "$PERF_TEST_JAR" ]] || die "perf-test.jar não encontrado. Rode bench_broker.sh primeiro."
-    [[ -x "$RABBITMQCTL"   ]] || die "rabbitmqctl não encontrado."
+    [[ -f "$PERF_TEST_JAR" ]]   || die "perf-test.jar não encontrado. Rode bench_broker.sh primeiro."
+    [[ -x "$RABBITMQCTL" ]]     || die "rabbitmqctl não encontrado."
+    [[ -x "$RABBITMQ_SERVER" ]] || die "sbin/rabbitmq-server não encontrado."
 
-    log "Benchmark estatístico: ${RUNS} runs × ${DURATION}s | ${PRODUCERS} prod | ${MSG_SIZE}B"
-    log "Total estimado: ~$(( (RUNS + 1) * DURATION * 2 / 60 )) minutos"
+    local est_min=$(( (WARMUP_PAIRS + RUNS) * 2 * DURATION / 60 + 2 ))
+    log "Benchmark dual-broker: ${RUNS} pares × 2 condições × ${DURATION}s | ${PRODUCERS} prod | ${MSG_SIZE}B"
+    log "Warmup: ${WARMUP_PAIRS} pares descartados | Total estimado: ~${est_min} minutos"
+    log "Design: dois brokers simultâneos, sem restart entre pares"
+
+    rm -rf "$TEST_TMPDIR"
+    mkdir -p "$TEST_TMPDIR"
+
+    start_node "$NODE_BASELINE" "$PORT_BASELINE" "$DIR_BASELINE" "$CONF_BASELINE" "false"
+    start_node "$NODE_IOURING"  "$PORT_IOURING"  "$DIR_IOURING"  "$CONF_IOURING"  "true"
 
     bar
-    log "=== FASE 1: Baseline (prim_file) ==="
+    log "Warmup: ${WARMUP_PAIRS} pares (descartados) para aquecer os message stores..."
     bar
-    start_broker "stat-baseline" "false"
-    collect_runs "baseline" "$BASELINE_CSV"
-    stop_broker
+    for i in $(seq 1 "$WARMUP_PAIRS"); do
+        log "  Warmup par $i/${WARMUP_PAIRS}..."
+        run_warmup_on "amqp://guest:guest@localhost:${PORT_BASELINE}" "$(( PORT_BASELINE + 10000 ))"
+        run_warmup_on "amqp://guest:guest@localhost:${PORT_IOURING}"  "$(( PORT_IOURING  + 10000 ))"
+    done
 
-    bar
-    log "=== FASE 2: io_uring ==="
-    bar
-    start_broker "stat-iouring" "true"
-    collect_runs "io_uring" "$IOURING_CSV"
-    stop_broker
+    > "$BASELINE_CSV"
+    > "$IOURING_CSV"
+
+    for i in $(seq 1 "$RUNS"); do
+        run_pair "$i"
+    done
+
+    stop_all_nodes
 
     bar
     log "Dados coletados. Rodando análise estatística..."
